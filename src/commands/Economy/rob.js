@@ -1,12 +1,12 @@
 import { SlashCommandBuilder } from 'discord.js';
-import { createEmbed, errorEmbed, successEmbed, infoEmbed, warningEmbed } from '../../utils/embeds.js';
+import { successEmbed, warningEmbed, buildUserErrorEmbed } from '../../utils/embeds.js';
 import { getEconomyData, setEconomyData } from '../../utils/economy.js';
 import { withErrorHandling, createError, ErrorTypes } from '../../utils/errorHandler.js';
-import { MessageTemplates } from '../../utils/messageTemplates.js';
 import { InteractionHelper } from '../../utils/interactionHelper.js';
+import { BotConfig } from '../../config/bot.js';
 
-const ROB_COOLDOWN = 4 * 60 * 60 * 1000;
-const BASE_ROB_SUCCESS_CHANCE = 0.25;
+const ROB_COOLDOWN = BotConfig.economy?.cooldowns?.rob ?? 4 * 60 * 60 * 1000;
+const BASE_ROB_SUCCESS_CHANCE = BotConfig.economy?.robSuccessRate ?? 0.4;
 const ROB_PERCENTAGE = 0.15;
 const FINE_PERCENTAGE = 0.1;
 
@@ -92,8 +92,8 @@ export default {
 
                 return await InteractionHelper.safeEditReply(interaction, {
                     embeds: [
-                        MessageTemplates.ERRORS.CONFIGURATION_REQUIRED(
-                            "robbery protection",
+                        warningEmbed(
+                            'Robbery Blocked',
                             `${victimUser.username} was prepared! Your attempt failed because they own a **Personal Safe**. You got away clean but didn't gain anything.`
                         )
                     ],
@@ -109,8 +109,8 @@ export default {
                 robberData.wallet = (robberData.wallet || 0) + amountStolen;
                 victimData.wallet = (victimData.wallet || 0) - amountStolen;
 
-                resultEmbed = MessageTemplates.SUCCESS.DATA_UPDATED(
-                    "robbery",
+                resultEmbed = successEmbed(
+                    'Robbery Successful',
                     `You successfully stole **$${amountStolen.toLocaleString()}** from ${victimUser.username}!`
                 );
             } else {
@@ -122,9 +122,10 @@ export default {
                     robberData.wallet = (robberData.wallet || 0) - fineAmount;
                 }
 
-                resultEmbed = MessageTemplates.ERRORS.INSUFFICIENT_PERMISSIONS(
-                    "robbery failed",
-                    `You failed the robbery and were caught! You were fined **$${fineAmount.toLocaleString()}** of your own cash.`
+                resultEmbed = buildUserErrorEmbed(
+                    'unknown',
+                    `You failed the robbery and were caught! You were fined **$${fineAmount.toLocaleString()}** of your own cash.`,
+                    { titleOverride: 'Robbery Failed' }
                 );
             }
 
@@ -146,11 +147,8 @@ export default {
                         inline: true,
                     },
                 )
-                .setFooter({ text: `Next robbery available in 4 hours.` });
+                .setFooter({ text: `Next robbery available in ${Math.ceil(ROB_COOLDOWN / (60 * 60 * 1000))} hours.` });
 
             await InteractionHelper.safeEditReply(interaction, { embeds: [resultEmbed] });
     }, { command: 'rob' })
 };
-
-
-

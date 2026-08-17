@@ -1,10 +1,9 @@
 import { botConfig, getColor } from '../../config/bot.js';
 import { SlashCommandBuilder, PermissionFlagsBits, ChannelType, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags } from 'discord.js';
-import { createEmbed, errorEmbed, infoEmbed, successEmbed } from '../../utils/embeds.js';
-import { getGuildConfig, setGuildConfig } from '../../services/guildConfig.js';
-import { handleInteractionError, withErrorHandling, createError, ErrorTypes } from '../../utils/errorHandler.js';
+import { createEmbed, infoEmbed, successEmbed } from '../../utils/embeds.js';
+import { getGuildConfig, setGuildConfig } from '../../services/config/guildConfig.js';
+import { withErrorHandling, createError, ErrorTypes, replyUserError } from '../../utils/errorHandler.js';
 import { removeVerification, verifyUser } from '../../services/verificationService.js';
-import { ContextualMessages } from '../../utils/messageTemplates.js';
 import { logger } from '../../utils/logger.js';
 import { InteractionHelper } from '../../utils/interactionHelper.js';
 import { getWelcomeConfig } from '../../utils/database.js';
@@ -183,7 +182,7 @@ async function handleSetup(interaction, guild, client) {
     await InteractionHelper.safeDefer(interaction);
 
     const verifyEmbed = createEmbed({
-        title: "✅ Server Verification",
+        title: "Server Verification",
         description: message,
         color: getColor('success')
     });
@@ -213,54 +212,39 @@ async function handleSetup(interaction, guild, client) {
     await setGuildConfig(client, guild.id, guildConfig);
 
     await InteractionHelper.safeEditReply(interaction, {
-        embeds: [ContextualMessages.configUpdated(
-            "Verification System",
+        embeds: [successEmbed(
+            'Verification System Updated',
             [
                 `Channel: ${verificationChannel}`,
                 `Verified Role: ${verifiedRole}`,
                 `Button Text: ${buttonText}`
-            ]
+            ].join('\n')
         )]
     });
 }
 
 async function handleRemove(interaction, guild, client) {
     const targetUser = interaction.options.getUser("user");
-    
-    try {
-        const result = await removeVerification(client, guild.id, targetUser.id, {
-            moderatorId: interaction.user.id,
-            reason: 'admin_removal'
-        });
 
-        if (!result.success) {
-            if (result.notVerified) {
-                return await InteractionHelper.safeReply(interaction, {
-                    embeds: [infoEmbed("Not Verified", `${targetUser.tag} does not currently have the verified role.`)],
-                    flags: MessageFlags.Ephemeral
-                });
-            }
-        }
+    const result = await removeVerification(client, guild.id, targetUser.id, {
+        moderatorId: interaction.user.id,
+        reason: 'admin_removal'
+    });
 
-        logger.info('Verification removed via command', {
-            guildId: guild.id,
-            targetUserId: targetUser.id,
-            moderatorId: interaction.user.id
-        });
-
+    if (result.status === 'not_verified') {
         return await InteractionHelper.safeReply(interaction, {
-            embeds: [successEmbed("Verification Removed", `Verification removed from ${targetUser.tag}.`)]
+            embeds: [infoEmbed('Not Verified', `${targetUser.tag} does not currently have the verified role.`)],
+            flags: MessageFlags.Ephemeral
         });
-
-    } catch (error) {
-        await handleInteractionError(
-            interaction,
-            error,
-            { command: 'verification', subcommand: 'remove' }
-        );
     }
+
+    logger.info('Verification removed via command', {
+        guildId: guild.id,
+        targetUserId: targetUser.id,
+        moderatorId: interaction.user.id
+    });
+
+    return await InteractionHelper.safeReply(interaction, {
+        embeds: [successEmbed('Verification Removed', `Verification removed from ${targetUser.tag}.`)]
+    });
 }
-
-
-
-

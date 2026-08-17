@@ -1,7 +1,45 @@
+// postgresDatabase.js
+
 import pg from 'pg';
-import { pgConfig } from '../config/postgres.js';
+import { pgConfig, resolvePostgresPoolConfig } from '../config/database/postgres.js';
 import { logger } from './logger.js';
 import { assertAllowlistedIdentifier, quoteIdentifier } from './sqlIdentifiers.js';
+import {
+    canonicalizeKey,
+    getLegacyVariantsForCanonical,
+} from './database/keys.js';
+import {
+    parseKey,
+    isTempBackedType,
+    getStructuredListPlan,
+} from './database/keyParser.js';
+import { runKeyMigration } from './database/keyMigration.js';
+import {
+    tableStatements,
+    indexStatements,
+    UPDATE_TIMESTAMP_FUNCTION,
+    triggerDefinitions,
+} from './database/schema.js';
+
+function normalizeTimestampInput(value, fallback = new Date()) {
+    if (value instanceof Date && !Number.isNaN(value.getTime())) {
+        return value;
+    }
+
+    const numericValue = typeof value === 'string' && /^[0-9]+$/.test(value)
+        ? Number(value)
+        : Number(value);
+
+    if (Number.isFinite(numericValue) && numericValue >= 0) {
+        const date = new Date(numericValue);
+        if (!Number.isNaN(date.getTime())) {
+            return date;
+        }
+    }
+
+    const parsedDate = new Date(value);
+    return !Number.isNaN(parsedDate.getTime()) ? parsedDate : fallback;
+}
 
 class PostgreSQLDatabase {
     constructor() {
@@ -13,10 +51,6 @@ class PostgreSQLDatabase {
         this.lastFailureReason = null;
         this.lastFailureMessage = null;
     }
-
-    
-
-
 
     async connect() {
         if (this.connectionPromise) {
@@ -37,26 +71,10 @@ class PostgreSQLDatabase {
             try {
                 await new Promise(resolve => setTimeout(resolve, 100));
 
-                this.pool = new pg.Pool({
-                    
-                    host: pgConfig.options.host,
-                    port: pgConfig.options.port,
-                    database: pgConfig.options.database,
-                    user: pgConfig.options.user,
-                    password: pgConfig.options.password,
-                    ssl: pgConfig.options.ssl,
-                    
-                    
-                    max: pgConfig.options.max,
-                    min: pgConfig.options.min,
-                    idleTimeoutMillis: pgConfig.options.idleTimeoutMillis,
-                    connectionTimeoutMillis: pgConfig.options.connectionTimeoutMillis,
-                    
-                    
-                    application_name: pgConfig.options.application_name,
-                    statement_timeout: pgConfig.options.statement_timeout,
-                    keepalives: pgConfig.options.keepalives,
-                    keepalives_idle: pgConfig.options.keepalives_idle,
+                this.pool = new pg.Pool(resolvePostgresPoolConfig());
+
+                this.pool.on('error', (error, client) => {
+                    logger.error('PostgreSQL pool error:', error);
                 });
 
                 const client = await this.pool.connect();
@@ -67,7 +85,7 @@ class PostgreSQLDatabase {
                 this.lastFailureMessage = null;
 
                 this.isConnected = true;
-                logger.info('✅ PostgreSQL Database initialized successfully');
+                logger.info('PostgreSQL Database initialized successfully');
 
                 if (pgConfig.features.autoCreateTables) {
                     await this.createTables();
@@ -84,7 +102,7 @@ class PostgreSQLDatabase {
                                 ALTER TABLE ${pgConfig.tables.guilds} 
                                 ADD COLUMN counters JSONB DEFAULT '[]'
                             `);
-                            logger.info('✅ Added counters column to guilds table');
+                            logger.info('Added counters column to guilds table');
                         }
                     } catch (error) {
                         logger.warn('Could not add counters column to guilds table:', error.message);
@@ -106,6 +124,7 @@ class PostgreSQLDatabase {
                             logger.warn(
                                 `No schema version found. Bootstrapped schema ledger to version ${pgConfig.migration.expectedVersion} (${pgConfig.migration.expectedLabel}).`
                             );
+                            await this.runStartupKeyMigration();
                             return true;
                         }
 
@@ -117,6 +136,7 @@ class PostgreSQLDatabase {
                     }
                 }
 
+                await this.runStartupKeyMigration();
                 return true;
             } catch (error) {
                 this.lastFailureReason = error.code || 'POSTGRES_CONNECTION_FAILED';
@@ -134,13 +154,13 @@ class PostgreSQLDatabase {
                 const isLastAttempt = attempt >= attempts;
                 const isSchemaMismatch = error.code === 'SCHEMA_VERSION_MISMATCH';
                 if (isLastAttempt) {
-                    logger.error('❌ Failed to initialize PostgreSQL Database:', error);
+                    logger.error('Failed to initialize PostgreSQL Database:', error);
                     this.isConnected = false;
                     return false;
                 }
 
                 if (isSchemaMismatch) {
-                    logger.error('❌ Failed to initialize PostgreSQL Database:', error);
+                    logger.error('Failed to initialize PostgreSQL Database:', error);
                     this.isConnected = false;
                     return false;
                 }
@@ -155,9 +175,23 @@ class PostgreSQLDatabase {
         return false;
     }
 
-    
+    async runStartupKeyMigration() {
+        if (pgConfig.features.autoMigrate === false) {
+            return;
+        }
 
-
+        try {
+            const result = await runKeyMigration({ pool: this.pool, logger });
+            if (result?.alreadyDone) {
+                logger.debug('Key migration already applied, skipping.');
+            } else if (result && (result.migrated > 0 || result.errors > 0)) {
+                logger.info('Startup key migration finished', result);
+            }
+        } catch (error) {
+            // Never block startup on key migration; legacy reads still work via fallback.
+            logger.error('Startup key migration failed (continuing with legacy fallback):', error);
+        }
+    }
 
     isAvailable() {
         return this.isConnected && this.pool;
@@ -239,176 +273,8 @@ class PostgreSQLDatabase {
         };
     }
 
-    /**
-     * Create database tables
-     */
     async createTables() {
-        const tables = [
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.guilds} (
-                id VARCHAR(20) PRIMARY KEY,
-                config JSONB DEFAULT '{}',
-                counters JSONB DEFAULT '[]',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.users} (
-                id VARCHAR(20) PRIMARY KEY,
-                username VARCHAR(100),
-                discriminator VARCHAR(10),
-                avatar VARCHAR(100),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.guild_users} (
-                guild_id VARCHAR(20),
-                user_id VARCHAR(20),
-                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (guild_id, user_id),
-                FOREIGN KEY (guild_id) REFERENCES ${pgConfig.tables.guilds}(id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES ${pgConfig.tables.users}(id) ON DELETE CASCADE
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.birthdays} (
-                guild_id VARCHAR(20),
-                user_id VARCHAR(20),
-                month INTEGER NOT NULL,
-                day INTEGER NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (guild_id, user_id),
-                FOREIGN KEY (guild_id) REFERENCES ${pgConfig.tables.guilds}(id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES ${pgConfig.tables.users}(id) ON DELETE CASCADE
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.giveaways} (
-                id SERIAL PRIMARY KEY,
-                guild_id VARCHAR(20),
-                message_id VARCHAR(20) NOT NULL,
-                data JSONB NOT NULL,
-                ends_at TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (guild_id) REFERENCES ${pgConfig.tables.guilds}(id) ON DELETE CASCADE,
-                UNIQUE(guild_id, message_id)
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.tickets} (
-                guild_id VARCHAR(20),
-                channel_id VARCHAR(20) PRIMARY KEY,
-                data JSONB NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                expires_at TIMESTAMP,
-                FOREIGN KEY (guild_id) REFERENCES ${pgConfig.tables.guilds}(id) ON DELETE CASCADE
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.afk_status} (
-                guild_id VARCHAR(20),
-                user_id VARCHAR(20),
-                reason TEXT,
-                status_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                expires_at TIMESTAMP,
-                PRIMARY KEY (guild_id, user_id),
-                FOREIGN KEY (guild_id) REFERENCES ${pgConfig.tables.guilds}(id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES ${pgConfig.tables.users}(id) ON DELETE CASCADE
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.welcome_configs} (
-                guild_id VARCHAR(20) PRIMARY KEY,
-                config JSONB NOT NULL DEFAULT '{}',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (guild_id) REFERENCES ${pgConfig.tables.guilds}(id) ON DELETE CASCADE
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.leveling_configs} (
-                guild_id VARCHAR(20) PRIMARY KEY,
-                config JSONB NOT NULL DEFAULT '{}',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (guild_id) REFERENCES ${pgConfig.tables.guilds}(id) ON DELETE CASCADE
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.user_levels} (
-                guild_id VARCHAR(20),
-                user_id VARCHAR(20),
-                xp BIGINT DEFAULT 0,
-                level INTEGER DEFAULT 0,
-                total_xp BIGINT DEFAULT 0,
-                last_message TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                rank INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (guild_id, user_id),
-                FOREIGN KEY (guild_id) REFERENCES ${pgConfig.tables.guilds}(id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES ${pgConfig.tables.users}(id) ON DELETE CASCADE
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.economy} (
-                guild_id VARCHAR(20),
-                user_id VARCHAR(20),
-                balance BIGINT DEFAULT 0,
-                bank BIGINT DEFAULT 0,
-                data JSONB DEFAULT '{}',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (guild_id, user_id),
-                FOREIGN KEY (guild_id) REFERENCES ${pgConfig.tables.guilds}(id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES ${pgConfig.tables.users}(id) ON DELETE CASCADE
-            )`,
-
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.verification_audit} (
-                id SERIAL PRIMARY KEY,
-                guild_id VARCHAR(20) NOT NULL,
-                user_id VARCHAR(20) NOT NULL,
-                action VARCHAR(50) NOT NULL,
-                source VARCHAR(50),
-                moderator_id VARCHAR(20),
-                metadata JSONB DEFAULT '{}',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.invite_tracking} (
-                guild_id VARCHAR(20),
-                inviter_id VARCHAR(20),
-                invite_code VARCHAR(20),
-                uses INTEGER DEFAULT 0,
-                data JSONB DEFAULT '{}',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (guild_id, invite_code),
-                FOREIGN KEY (guild_id) REFERENCES ${pgConfig.tables.guilds}(id) ON DELETE CASCADE
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.application_roles} (
-                guild_id VARCHAR(20),
-                role_id VARCHAR(20),
-                data JSONB DEFAULT '{}',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (guild_id, role_id),
-                FOREIGN KEY (guild_id) REFERENCES ${pgConfig.tables.guilds}(id) ON DELETE CASCADE
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.temp_data} (
-                key VARCHAR(255) PRIMARY KEY,
-                value JSONB NOT NULL,
-                expires_at TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.cache_data} (
-                key VARCHAR(255) PRIMARY KEY,
-                value JSONB NOT NULL,
-                expires_at TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )`
-        ];
-
-        for (const table of tables) {
+        for (const table of tableStatements) {
             try {
                 await this.pool.query(table);
             } catch (error) {
@@ -416,38 +282,14 @@ class PostgreSQLDatabase {
             }
         }
         
-        logger.info('✅ Database tables created/verified');
+        logger.info('Database tables created/verified');
         
         await this.createIndexes();
         await this.createAuditTriggers();
     }
 
-    
-
-
     async createIndexes() {
-        const indexes = [
-            `CREATE INDEX IF NOT EXISTS idx_guild_users_guild_id ON ${pgConfig.tables.guild_users}(guild_id)`,
-            `CREATE INDEX IF NOT EXISTS idx_guild_users_user_id ON ${pgConfig.tables.guild_users}(user_id)`,
-            `CREATE INDEX IF NOT EXISTS idx_birthdays_guild_id ON ${pgConfig.tables.birthdays}(guild_id)`,
-            `CREATE INDEX IF NOT EXISTS idx_birthdays_month_day ON ${pgConfig.tables.birthdays}(month, day)`,
-            `CREATE INDEX IF NOT EXISTS idx_giveaways_guild_id ON ${pgConfig.tables.giveaways}(guild_id)`,
-            `CREATE INDEX IF NOT EXISTS idx_giveaways_ends_at ON ${pgConfig.tables.giveaways}(ends_at)`,
-            `CREATE INDEX IF NOT EXISTS idx_tickets_guild_id ON ${pgConfig.tables.tickets}(guild_id)`,
-            `CREATE INDEX IF NOT EXISTS idx_tickets_expires_at ON ${pgConfig.tables.tickets}(expires_at)`,
-            `CREATE INDEX IF NOT EXISTS idx_afk_status_guild_id ON ${pgConfig.tables.afk_status}(guild_id)`,
-            `CREATE INDEX IF NOT EXISTS idx_afk_status_expires_at ON ${pgConfig.tables.afk_status}(expires_at)`,
-            `CREATE INDEX IF NOT EXISTS idx_user_levels_guild_id ON ${pgConfig.tables.user_levels}(guild_id)`,
-            `CREATE INDEX IF NOT EXISTS idx_user_levels_xp ON ${pgConfig.tables.user_levels}(xp)`,
-            `CREATE INDEX IF NOT EXISTS idx_economy_guild_id ON ${pgConfig.tables.economy}(guild_id)`,
-            `CREATE INDEX IF NOT EXISTS idx_verification_audit_guild_id ON ${pgConfig.tables.verification_audit}(guild_id)`,
-            `CREATE INDEX IF NOT EXISTS idx_verification_audit_user_id ON ${pgConfig.tables.verification_audit}(user_id)`,
-            `CREATE INDEX IF NOT EXISTS idx_verification_audit_created_at ON ${pgConfig.tables.verification_audit}(created_at)`,
-            `CREATE INDEX IF NOT EXISTS idx_temp_data_expires_at ON ${pgConfig.tables.temp_data}(expires_at)`,
-            `CREATE INDEX IF NOT EXISTS idx_cache_data_expires_at ON ${pgConfig.tables.cache_data}(expires_at)`
-        ];
-
-        for (const index of indexes) {
+        for (const index of indexStatements) {
             try {
                 await this.pool.query(index);
             } catch (error) {
@@ -455,41 +297,14 @@ class PostgreSQLDatabase {
             }
         }
         
-        logger.info('✅ Performance indexes created/verified');
+        logger.info('Performance indexes created/verified');
     }
-
-    
-
 
     async createAuditTriggers() {
         try {
-            const functionQuery = `
-                CREATE OR REPLACE FUNCTION update_updated_at_column()
-                RETURNS TRIGGER AS $$
-                BEGIN
-                    NEW.updated_at = CURRENT_TIMESTAMP;
-                    RETURN NEW;
-                END;
-                $$ language 'plpgsql';
-            `;
-            
-            await this.pool.query(functionQuery);
-            
-            const triggers = [
-                { name: 'update_guilds_updated_at', table: pgConfig.tables.guilds },
-                { name: 'update_users_updated_at', table: pgConfig.tables.users },
-                { name: 'update_welcome_configs_updated_at', table: pgConfig.tables.welcome_configs },
-                { name: 'update_leveling_configs_updated_at', table: pgConfig.tables.leveling_configs },
-                { name: 'update_user_levels_updated_at', table: pgConfig.tables.user_levels },
-                { name: 'update_economy_updated_at', table: pgConfig.tables.economy },
-                { name: 'update_application_roles_updated_at', table: pgConfig.tables.application_roles },
-                { name: 'update_invite_tracking_updated_at', table: pgConfig.tables.invite_tracking },
-                { name: 'update_guild_users_updated_at', table: pgConfig.tables.guild_users },
-                { name: 'update_birthdays_updated_at', table: pgConfig.tables.birthdays },
-                { name: 'update_giveaways_updated_at', table: pgConfig.tables.giveaways },
-                { name: 'update_tickets_updated_at', table: pgConfig.tables.tickets },
-                { name: 'update_afk_status_updated_at', table: pgConfig.tables.afk_status },
-            ];
+            await this.pool.query(UPDATE_TIMESTAMP_FUNCTION);
+
+            const triggers = triggerDefinitions;
 
             const allowedTriggerIdentifiers = new Set(triggers.map(trigger => trigger.name));
 
@@ -519,17 +334,40 @@ class PostgreSQLDatabase {
                 }
             }
             
-            logger.info('✅ Audit triggers created/verified');
+            logger.info('Audit triggers created/verified');
         } catch (error) {
             logger.warn('Error creating audit triggers:', error.message);
         }
     }
 
-    
+    async _getTempValue(key, defaultValue = null) {
+        const result = await this.pool.query(
+            `SELECT value FROM ${pgConfig.tables.temp_data} WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())`,
+            [key],
+        );
+        return result.rows.length > 0 ? result.rows[0].value : defaultValue;
+    }
 
+    async _getWithLegacyFallback(canonicalKey, originalKey, defaultValue) {
+        let value = await this._getTempValue(canonicalKey, defaultValue);
+        if (value !== defaultValue) {
+            return value;
+        }
 
+        const legacyKeys = new Set([
+            ...(originalKey !== canonicalKey ? [originalKey] : []),
+            ...getLegacyVariantsForCanonical(canonicalKey),
+        ]);
 
+        for (const legacyKey of legacyKeys) {
+            value = await this._getTempValue(legacyKey, defaultValue);
+            if (value !== defaultValue) {
+                return value;
+            }
+        }
 
+        return defaultValue;
+    }
 
     async get(key, defaultValue = null) {
         try {
@@ -538,37 +376,39 @@ class PostgreSQLDatabase {
                 return defaultValue;
             }
 
-            const parsedKey = this.parseKey(key);
-            
-            if (parsedKey.type === 'temp') {
-                const result = await this.pool.query(
-                    `SELECT value FROM ${pgConfig.tables.temp_data} WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())`,
-                    [parsedKey.fullKey]
-                );
-                return result.rows.length > 0 ? result.rows[0].value : defaultValue;
+            const canonicalKey = canonicalizeKey(key);
+            const parsedKey = parseKey(canonicalKey);
+
+            if (parsedKey.type === 'temp' || isTempBackedType(parsedKey.type)) {
+                return await this._getWithLegacyFallback(parsedKey.fullKey, key, defaultValue);
             }
-            
+
             if (parsedKey.type === 'cache') {
                 const result = await this.pool.query(
                     `SELECT value FROM ${pgConfig.tables.cache_data} WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())`,
-                    [parsedKey.fullKey]
+                    [parsedKey.fullKey],
                 );
                 return result.rows.length > 0 ? result.rows[0].value : defaultValue;
             }
 
-            return await this.getStructuredData(parsedKey, defaultValue);
+            const structuredValue = await this.getStructuredData(parsedKey, defaultValue);
+            if (structuredValue !== defaultValue) {
+                return structuredValue;
+            }
+
+            if (canonicalKey !== key) {
+                const legacyParsed = parseKey(key);
+                if (legacyParsed.fullKey !== parsedKey.fullKey) {
+                    return await this.getStructuredData(legacyParsed, defaultValue);
+                }
+            }
+
+            return structuredValue;
         } catch (error) {
             logger.error(`Error getting value for key ${key}:`, error);
             return defaultValue;
         }
     }
-
-    
-
-
-
-
-
 
     async set(key, value, ttl = null) {
         try {
@@ -577,26 +417,27 @@ class PostgreSQLDatabase {
                 return false;
             }
 
-            const parsedKey = this.parseKey(key);
+            const canonicalKey = canonicalizeKey(key);
+            const parsedKey = parseKey(canonicalKey);
             const expiresAt = ttl ? new Date(Date.now() + ttl * 1000) : null;
             const jsonValue = JSON.stringify(value ?? null);
-            
-            if (parsedKey.type === 'temp') {
+
+            if (parsedKey.type === 'temp' || isTempBackedType(parsedKey.type)) {
                 await this.pool.query(
-                    `INSERT INTO ${pgConfig.tables.temp_data} (key, value, expires_at) 
-                     VALUES ($1, $2, $3) 
+                    `INSERT INTO ${pgConfig.tables.temp_data} (key, value, expires_at)
+                     VALUES ($1, $2, $3)
                      ON CONFLICT (key) DO UPDATE SET value = $2, expires_at = $3`,
-                    [parsedKey.fullKey, jsonValue, expiresAt]
+                    [parsedKey.fullKey, jsonValue, expiresAt],
                 );
                 return true;
             }
-            
+
             if (parsedKey.type === 'cache') {
                 await this.pool.query(
-                    `INSERT INTO ${pgConfig.tables.cache_data} (key, value, expires_at) 
-                     VALUES ($1, $2, $3) 
+                    `INSERT INTO ${pgConfig.tables.cache_data} (key, value, expires_at)
+                     VALUES ($1, $2, $3)
                      ON CONFLICT (key) DO UPDATE SET value = $2, expires_at = $3`,
-                    [parsedKey.fullKey, jsonValue, expiresAt]
+                    [parsedKey.fullKey, jsonValue, expiresAt],
                 );
                 return true;
             }
@@ -608,11 +449,6 @@ class PostgreSQLDatabase {
         }
     }
 
-    
-
-
-
-
     async delete(key) {
         try {
             if (!this.isAvailable()) {
@@ -620,29 +456,34 @@ class PostgreSQLDatabase {
                 return false;
             }
 
-            const parsedKey = this.parseKey(key);
-            
-            if (parsedKey.type === 'temp') {
+            const canonicalKey = canonicalizeKey(key);
+            const parsedKey = parseKey(canonicalKey);
+            let deleted = false;
+
+            if (parsedKey.type === 'temp' || isTempBackedType(parsedKey.type)) {
                 await this.pool.query(`DELETE FROM ${pgConfig.tables.temp_data} WHERE key = $1`, [parsedKey.fullKey]);
-                return true;
-            }
-            
-            if (parsedKey.type === 'cache') {
+                deleted = true;
+            } else if (parsedKey.type === 'cache') {
                 await this.pool.query(`DELETE FROM ${pgConfig.tables.cache_data} WHERE key = $1`, [parsedKey.fullKey]);
-                return true;
+                deleted = true;
+            } else {
+                deleted = await this.deleteStructuredData(parsedKey);
             }
 
-            return await this.deleteStructuredData(parsedKey);
+            for (const legacyKey of getLegacyVariantsForCanonical(canonicalKey)) {
+                await this.pool.query(`DELETE FROM ${pgConfig.tables.temp_data} WHERE key = $1`, [legacyKey]);
+            }
+
+            if (key !== canonicalKey) {
+                await this.pool.query(`DELETE FROM ${pgConfig.tables.temp_data} WHERE key = $1`, [key]);
+            }
+
+            return deleted;
         } catch (error) {
             logger.error(`Error deleting key ${key}:`, error);
             return false;
         }
     }
-
-    
-
-
-
 
     async list(prefix) {
         try {
@@ -651,31 +492,48 @@ class PostgreSQLDatabase {
                 return [];
             }
 
-            const keys = [];
-            
-            const tempResult = await this.pool.query(
-                `SELECT key FROM ${pgConfig.tables.temp_data} WHERE key LIKE $1 AND (expires_at IS NULL OR expires_at > NOW())`,
-                [`${prefix}%`]
-            );
-            keys.push(...tempResult.rows.map(row => row.key));
-            
+            const keys = new Set();
+            const plan = getStructuredListPlan(prefix, pgConfig.tables);
+            const tempPrefixes = plan.tempPrefixes ?? [prefix];
+
+            for (const tempPrefix of tempPrefixes) {
+                const tempResult = await this.pool.query(
+                    `SELECT key FROM ${pgConfig.tables.temp_data} WHERE key LIKE $1 AND (expires_at IS NULL OR expires_at > NOW())`,
+                    [`${tempPrefix}%`],
+                );
+                for (const row of tempResult.rows) {
+                    keys.add(canonicalizeKey(row.key));
+                }
+            }
+
             const cacheResult = await this.pool.query(
                 `SELECT key FROM ${pgConfig.tables.cache_data} WHERE key LIKE $1 AND (expires_at IS NULL OR expires_at > NOW())`,
-                [`${prefix}%`]
+                [`${prefix}%`],
             );
-            keys.push(...cacheResult.rows.map(row => row.key));
+            for (const row of cacheResult.rows) {
+                keys.add(row.key);
+            }
 
-            return keys;
+            for (const query of plan.queries) {
+                const result = await this.pool.query(query.sql, query.params);
+                for (const row of result.rows) {
+                    keys.add(query.mapKey(row));
+                }
+            }
+
+            for (const staticKey of plan.staticKeys ?? []) {
+                if (!staticKey.startsWith(prefix)) continue;
+                if (await this.exists(staticKey)) {
+                    keys.add(staticKey);
+                }
+            }
+
+            return [...keys];
         } catch (error) {
             logger.error(`Error listing keys with prefix ${prefix}:`, error);
             return [];
         }
     }
-
-    
-
-
-
 
     async insertVerificationAudit(record) {
         try {
@@ -708,11 +566,6 @@ class PostgreSQLDatabase {
         }
     }
 
-    
-
-
-
-
     async exists(key) {
         try {
             if (!this.isAvailable()) {
@@ -726,12 +579,6 @@ class PostgreSQLDatabase {
             return false;
         }
     }
-
-    
-
-
-
-
 
     async increment(key, amount = 1) {
         try {
@@ -749,12 +596,6 @@ class PostgreSQLDatabase {
         }
     }
 
-    
-
-
-
-
-
     async decrement(key, amount = 1) {
         try {
             if (!this.isAvailable()) {
@@ -771,67 +612,6 @@ class PostgreSQLDatabase {
         }
     }
 
-    parseKey(key) {
-        
-        if (key.startsWith('temp:')) {
-            return { type: 'temp', fullKey: key };
-        }
-        if (key.startsWith('cache:')) {
-            return { type: 'cache', fullKey: key };
-        }
-
-        const parts = key.split(':');
-        
-        
-        if (parts[0] === 'guild') {
-            if (parts[2] === 'config') {
-                return { type: 'guild_config', guildId: parts[1], fullKey: key };
-            }
-            if (parts[2] === 'birthdays') {
-                return { type: 'guild_birthdays', guildId: parts[1], fullKey: key };
-            }
-            if (parts[2] === 'giveaways') {
-                return { type: 'guild_giveaways', guildId: parts[1], fullKey: key };
-            }
-            if (parts[2] === 'welcome') {
-                return { type: 'welcome_config', guildId: parts[1], fullKey: key };
-            }
-            if (parts[2] === 'leveling') {
-                
-                if (parts[3] === 'config') {
-                    return { type: 'leveling_config', guildId: parts[1], fullKey: key };
-                }
-                if (parts[3] === 'users') {
-                    return { type: 'user_level', guildId: parts[1], userId: parts[4], fullKey: key };
-                }
-                return { type: 'leveling_data', guildId: parts[1], fullKey: key };
-            }
-            if (parts[2] === 'economy' && parts[3]) {
-                return { type: 'economy', guildId: parts[1], userId: parts[3], fullKey: key };
-            }
-            if (parts[2] === 'afk' && parts[3]) {
-                return { type: 'afk_status', guildId: parts[1], userId: parts[3], fullKey: key };
-            }
-            if (parts[2] === 'ticket' && parts[3]) {
-                return { type: 'ticket', guildId: parts[1], channelId: parts[3], fullKey: key };
-            }
-        }
-
-        
-        if (parts[0] === 'counters' && parts[1]) {
-            return { type: 'counters', guildId: parts[1], fullKey: key };
-        }
-
-        
-        return { type: 'temp', fullKey: key };
-    }
-
-    /**
-     * Get structured data from appropriate table
-     * @param {Object} parsedKey - Parsed key information
-     * @param {any} defaultValue - Default value
-     * @returns {Promise<any>} The data
-     */
     async getStructuredData(parsedKey, defaultValue) {
         try {
             switch (parsedKey.type) {
@@ -874,12 +654,22 @@ class PostgreSQLDatabase {
                     );
                     return levelingConfigResult.rows.length > 0 ? levelingConfigResult.rows[0].config : defaultValue;
                 
-                case 'user_level':
+                case 'user_level': {
                     const userLevelResult = await this.pool.query(
                         `SELECT xp, level, total_xp, last_message, rank FROM ${pgConfig.tables.user_levels} WHERE guild_id = $1 AND user_id = $2`,
                         [parsedKey.guildId, parsedKey.userId]
                     );
-                    return userLevelResult.rows.length > 0 ? userLevelResult.rows[0] : defaultValue;
+                    if (userLevelResult.rows.length === 0) return defaultValue;
+                    // Map snake_case columns to the camelCase shape consumers expect
+                    const levelRow = userLevelResult.rows[0];
+                    return {
+                        xp: Number(levelRow.xp) || 0,
+                        level: Number(levelRow.level) || 0,
+                        totalXp: Number(levelRow.total_xp) || 0,
+                        lastMessage: Number(levelRow.last_message) || 0,
+                        rank: Number(levelRow.rank) || 0,
+                    };
+                }
                 
                 case 'economy': {
                     const economyResult = await this.pool.query(
@@ -888,20 +678,26 @@ class PostgreSQLDatabase {
                     );
                     if (economyResult.rows.length === 0) return defaultValue;
                     const row = economyResult.rows[0];
-                    // Return the full data blob when available (contains wallet, bank, etc.)
-                    // Fall back to constructing a compatible object from the columns
+
                     if (row.data && typeof row.data === 'object' && Object.keys(row.data).length > 0) {
                         return row.data;
                     }
                     return { wallet: row.balance ?? 0, bank: row.bank ?? 0 };
                 }
                 
-                case 'afk_status':
+                case 'afk_status': {
                     const afkResult = await this.pool.query(
                         `SELECT reason, status_at, expires_at FROM ${pgConfig.tables.afk_status} WHERE guild_id = $1 AND user_id = $2`,
-                        [parsedKey.guildId, parsedKey.userId]
+                        [parsedKey.guildId, parsedKey.userId],
                     );
-                    return afkResult.rows.length > 0 ? afkResult.rows[0] : defaultValue;
+                    if (afkResult.rows.length === 0) return defaultValue;
+                    const row = afkResult.rows[0];
+                    return {
+                        reason: row.reason,
+                        setAt: row.status_at,
+                        expiresAt: row.expires_at,
+                    };
+                }
                 
                 case 'ticket':
                     const ticketResult = await this.pool.query(
@@ -926,13 +722,6 @@ class PostgreSQLDatabase {
         }
     }
 
-    /**
-     * Set structured data to appropriate table
-     * @param {Object} parsedKey - Parsed key information
-     * @param {any} value - Value to set
-     * @param {number} ttl - Optional TTL
-     * @returns {Promise<boolean>} Success status
-     */
     async setStructuredData(parsedKey, value, ttl) {
         try {
             switch (parsedKey.type) {
@@ -1043,13 +832,16 @@ class PostgreSQLDatabase {
                          ON CONFLICT (id) DO NOTHING`,
                         [parsedKey.userId]
                     );
+
+                    const lastMessageValue = value?.lastMessage ?? value?.last_message;
+                    const normalizedLastMessage = normalizeTimestampInput(lastMessageValue, new Date());
                     
                     await this.pool.query(
                         `INSERT INTO ${pgConfig.tables.user_levels} (guild_id, user_id, xp, level, total_xp, last_message, rank, updated_at) 
                          VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP) 
                          ON CONFLICT (guild_id, user_id) DO UPDATE SET 
                          xp = $3, level = $4, total_xp = $5, last_message = $6, rank = $7, updated_at = CURRENT_TIMESTAMP`,
-                        [parsedKey.guildId, parsedKey.userId, value.xp || 0, value.level || 0, value.totalXp || 0, value.lastMessage || new Date(), value.rank || 0]
+                        [parsedKey.guildId, parsedKey.userId, value.xp || 0, value.level || 0, value.totalXp || 0, normalizedLastMessage, value.rank || 0]
                     );
                     return true;
                 
@@ -1097,7 +889,7 @@ class PostgreSQLDatabase {
                          VALUES ($1, $2, $3, $4) 
                          ON CONFLICT (guild_id, user_id) DO UPDATE SET 
                          reason = $3, expires_at = $4, status_at = CURRENT_TIMESTAMP`,
-                        [parsedKey.guildId, parsedKey.userId, value.reason, value.expiresAt ? new Date(value.expiresAt) : null]
+                        [parsedKey.guildId, parsedKey.userId, value.reason, (value.expiresAt ?? value.expires_at) ? new Date(value.expiresAt ?? value.expires_at) : null]
                     );
                     return true;
                 
@@ -1139,7 +931,7 @@ class PostgreSQLDatabase {
                                 ALTER TABLE ${pgConfig.tables.guilds} 
                                 ADD COLUMN counters JSONB DEFAULT '[]'
                             `);
-                            logger.info('✅ Added counters column to guilds table');
+                            logger.info('Added counters column to guilds table');
                         } catch (alterError) {
                             logger.error('Failed to add counters column:', alterError);
                             throw new Error(`Counters column missing and could not be created: ${alterError.message}`);
@@ -1173,11 +965,6 @@ class PostgreSQLDatabase {
         }
     }
 
-    /**
-     * Delete structured data from appropriate table
-     * @param {Object} parsedKey - Parsed key information
-     * @returns {Promise<boolean>} Success status
-     */
     async deleteStructuredData(parsedKey) {
         try {
             switch (parsedKey.type) {
@@ -1216,6 +1003,13 @@ class PostgreSQLDatabase {
                 case 'ticket':
                     await this.pool.query(`DELETE FROM ${pgConfig.tables.tickets} WHERE guild_id = $1 AND channel_id = $2`, [parsedKey.guildId, parsedKey.channelId]);
                     return true;
+
+                case 'counters':
+                    await this.pool.query(
+                        `UPDATE ${pgConfig.tables.guilds} SET counters = '[]'::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+                        [parsedKey.guildId],
+                    );
+                    return true;
                 
                 default:
                     return false;
@@ -1225,9 +1019,6 @@ class PostgreSQLDatabase {
             return false;
         }
     }
-
-    
-
 
     async disconnect() {
         try {
@@ -1239,10 +1030,6 @@ class PostgreSQLDatabase {
             logger.error('Error closing PostgreSQL connection:', error);
         }
     }
-
-    
-
-
 
     async getInfo() {
         try {
@@ -1268,6 +1055,3 @@ class PostgreSQLDatabase {
 const pgDb = new PostgreSQLDatabase();
 
 export { PostgreSQLDatabase, pgDb };
-
-
-

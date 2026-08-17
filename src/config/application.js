@@ -2,15 +2,9 @@ import { fileURLToPath } from "url";
 import path from "path";
 import botConfig, { validateConfig } from "./bot.js";
 import { shopConfig as shop } from "./shop/index.js";
-import { pgConfig } from "./postgres.js";
-
+import { pgConfig } from "./database/postgres.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-
-
-
-
 
 const appConfig = {
   paths: {
@@ -28,6 +22,7 @@ const appConfig = {
     ...botConfig,
     token: process.env.DISCORD_TOKEN || process.env.TOKEN,
     clientId: process.env.CLIENT_ID,
+    // Retained for tutorial/setup compatibility; not used for command registration.
     guildId: process.env.GUILD_ID,
 
     shop: {
@@ -77,40 +72,9 @@ const appConfig = {
 
   shop,
 
-  
-
-
-
-
   features: {
-    
-    economy: true,                  
-    leveling: true,                 
-    moderation: true,               
-    logging: true,                  
-    welcome: true,                  
-
-    
-    tickets: true,                  
-    giveaways: true,                
-    birthday: true,                 
-    counter: true,                  
-
-    
-    verification: true,             
-    reactionRoles: true,            
-    joinToCreate: true,             
-
-    
-    voice: true,                    
-    search: true,                   
-    tools: true,                    
-    utility: true,                  
-    community: true,                
-    fun: true,                      
-
-    
-    music: false,                   
+    ...botConfig.features,
+    music: botConfig.features?.music ?? true,
   },
 
   env: process.env.NODE_ENV || "development",

@@ -1,6 +1,6 @@
 import { Events, EmbedBuilder, PermissionFlagsBits } from 'discord.js';
-import { getColor } from '../config/bot.js';
-import { getGuildConfig } from '../services/guildConfig.js';
+import { getColor, botConfig } from '../config/bot.js';
+import { getGuildConfig } from '../services/config/guildConfig.js';
 import { getWelcomeConfig } from '../utils/database.js';
 import { formatWelcomeMessage } from '../utils/welcome.js';
 import { logEvent, EVENT_TYPES } from '../services/loggingService.js';
@@ -24,16 +24,14 @@ export default {
 
         if (welcomeConfig?.enabled && welcomeChannelId) {
             const channel = guild.channels.cache.get(welcomeChannelId);
-            if (channel?.isTextBased?.()) {
-                const me = guild.members.me;
-                const permissions = me ? channel.permissionsFor(me) : null;
-                if (!permissions?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages])) {
-                    return;
-                }
-
+            const me = guild.members.me;
+            const permissions = channel?.isTextBased?.() && me ? channel.permissionsFor(me) : null;
+            // Skip only the welcome message if permissions are missing; the rest of the
+            // join pipeline (auto-role, verification, logging, counters) must still run.
+            if (permissions?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages])) {
                 const formatData = { user, guild, member };
                 const welcomeMessage = formatWelcomeMessage(
-                    welcomeConfig.welcomeMessage || welcomeConfig.welcomeEmbed?.description || 'Welcome {user} to {server}!',
+                    welcomeConfig.welcomeMessage || welcomeConfig.welcomeEmbed?.description || botConfig.welcome?.defaultWelcomeMessage || 'Welcome {user} to {server}!',
                     formatData
                 );
 
@@ -106,39 +104,28 @@ export default {
             await handleVerification(member, guild, config.verification, member.client);
         }
 
-        
         try {
             await logEvent({
                 client: member.client,
                 guildId: guild.id,
                 eventType: EVENT_TYPES.MEMBER_JOIN,
                 data: {
-                    description: `${user.tag} joined the server`,
+                    title: 'User joined',
+                    lines: [
+                        `**User:** ${user.toString()} (${user.displayName !== user.username ? `@${user.displayName}` : user.tag})`,
+                        `**ID:** \`${user.id}\``,
+                        `**Created:** <t:${Math.floor(user.createdTimestamp / 1000)}:R>`,
+                        `**Members:** ${guild.memberCount}`,
+                    ],
+                    quoted: false,
+                    thumbnail: user.displayAvatarURL({ dynamic: true }),
                     userId: user.id,
-                    fields: [
-                        {
-                            name: '👤 Member',
-                            value: `${user.tag} (${user.id})`,
-                            inline: true
-                        },
-                        {
-                            name: '👥 Member Count',
-                            value: guild.memberCount.toString(),
-                            inline: true
-                        },
-                        {
-                            name: '📅 Account Created',
-                            value: `<t:${Math.floor(user.createdTimestamp / 1000)}:R>`,
-                            inline: true
-                        }
-                    ]
                 }
             });
         } catch (error) {
             logger.debug('Error logging member join:', error);
         }
-        
-        
+
         try {
             const counters = await getServerCounters(member.client, guild.id);
             for (const counter of counters) {
@@ -149,8 +136,7 @@ export default {
         } catch (error) {
             logger.debug('Error updating counters on member join:', error);
         }
-        
-        // Restore birthday data if the member previously left
+
         try {
             const backupKey = `guild:${guild.id}:birthdays:left`;
             const backup = (await member.client.db.get(backupKey)) || {};
@@ -210,6 +196,3 @@ async function assignRoleSafely(member, role) {
         logger.warn(`Failed to assign role ${role.id} to member ${member.id}:`, error);
     }
 }
-
-
-

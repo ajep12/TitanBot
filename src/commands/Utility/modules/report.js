@@ -1,8 +1,9 @@
-import { getColor } from '../../../config/bot.js';
-import { createEmbed, errorEmbed } from '../../../utils/embeds.js';
-import { getGuildConfig } from '../../../services/guildConfig.js';
+import { createEmbed } from '../../../utils/embeds.js';
+import { getGuildConfig } from '../../../services/config/guildConfig.js';
+import { logEvent, EVENT_TYPES, resolveLogChannel } from '../../../services/loggingService.js';
+import { formatLogLine, resolveUserAuthor } from '../../../utils/logging/logEmbeds.js';
 import { InteractionHelper } from '../../../utils/interactionHelper.js';
-import { handleInteractionError } from '../../../utils/errorHandler.js';
+import { replyUserError, ErrorTypes } from '../../../utils/errorHandler.js';
 import { logger } from '../../../utils/logger.js';
 
 export default {
@@ -18,52 +19,46 @@ export default {
         const guildId = interaction.guildId;
 
         const guildConfig = await getGuildConfig(client, guildId);
-        const reportChannelId = guildConfig.reportChannelId;
+        const reportChannelId = resolveLogChannel(guildConfig, 'reports');
 
         if (!reportChannelId) {
-            return InteractionHelper.safeEditReply(interaction, {
-                embeds: [errorEmbed('Setup Required', 'The report channel has not been set up. Please ask a moderator to use `/report setchannel` first.')],
-            });
+            return await replyUserError(interaction, { type: ErrorTypes.UNKNOWN, message: 'The report channel has not been set up. Ask a moderator to use `/logging dashboard` or `/logging channel`.' });
         }
 
-        const reportChannel = interaction.guild.channels.cache.get(reportChannelId);
-        if (!reportChannel) {
-            return InteractionHelper.safeEditReply(interaction, {
-                embeds: [errorEmbed('Channel Missing', 'The configured report channel is missing or inaccessible. Please ask a moderator to reset it.')],
-            });
-        }
+        const ownerMention = interaction.guild.ownerId
+            ? `<@${interaction.guild.ownerId}> New report!`
+            : 'New report!';
 
-        try {
-            const reportEmbed = createEmbed({
-                title: `🚨 NEW USER REPORT: ${targetUser.tag}`,
-                description: `**Reported By:** ${interaction.user.tag} (\`${interaction.user.id}\`)\n**Reported User:** ${targetUser.tag} (\`${targetUser.id}\`)`,
-            })
-                .setColor(getColor('error'))
-                .setThumbnail(targetUser.displayAvatarURL())
-                .addFields(
-                    { name: 'Reason', value: reason },
-                    { name: 'Reported In Channel', value: interaction.channel.toString(), inline: true },
-                    { name: 'Time', value: new Date().toUTCString(), inline: true },
-                );
+        await logEvent({
+            client,
+            guildId,
+            eventType: EVENT_TYPES.REPORT_FILE,
+            content: ownerMention,
+            data: {
+                title: 'User Report',
+                lines: [
+                    formatLogLine('Reported User', `${targetUser.tag} (\`${targetUser.id}\`)`),
+                    formatLogLine('Reported By', `${interaction.user.tag} (\`${interaction.user.id}\`)`),
+                    formatLogLine('Channel', interaction.channel.toString()),
+                ],
+                blockFields: [{ name: 'Reason', value: reason }],
+                author: await resolveUserAuthor(client, targetUser.id),
+                thumbnail: targetUser.displayAvatarURL(),
+            },
+        });
 
-            await reportChannel.send({
-                content: `<@&${interaction.guild.ownerId}> New Report!`,
-                embeds: [reportEmbed],
-            });
+        await InteractionHelper.safeEditReply(interaction, {
+            embeds: [createEmbed({
+                title: 'Report Submitted',
+                description: `Your report against **${targetUser.tag}** has been successfully filed and sent to the moderation team. Thank you!`,
+            })],
+        });
 
-            await InteractionHelper.safeEditReply(interaction, {
-                embeds: [createEmbed({ title: '✅ Report Submitted', description: `Your report against **${targetUser.tag}** has been successfully filed and sent to the moderation team. Thank you!` })],
-            });
-
-            logger.info('Report submitted', {
-                userId: interaction.user.id,
-                reportedUserId: targetUser.id,
-                guildId,
-                reasonLength: reason.length,
-            });
-        } catch (error) {
-            logger.error('report error:', error);
-            await handleInteractionError(interaction, error, { commandName: 'report', source: 'report' });
-        }
+        logger.info('Report submitted', {
+            userId: interaction.user.id,
+            reportedUserId: targetUser.id,
+            guildId,
+            reasonLength: reason.length,
+        });
     },
 };

@@ -4,10 +4,11 @@ import { getEconomyData, setEconomyData } from '../../utils/economy.js';
 import { withErrorHandling, createError, ErrorTypes } from '../../utils/errorHandler.js';
 import { logger } from '../../utils/logger.js';
 import { InteractionHelper } from '../../utils/interactionHelper.js';
+import { botConfig } from '../../config/bot.js';
 
-const WORK_COOLDOWN = 30 * 60 * 1000;
-const MIN_WORK_AMOUNT = 50;
-const MAX_WORK_AMOUNT = 300;
+const WORK_COOLDOWN = botConfig.economy?.cooldowns?.work ?? 30 * 60 * 1000;
+const MIN_WORK_AMOUNT = botConfig.economy?.workMin ?? 10;
+const MAX_WORK_AMOUNT = botConfig.economy?.workMax ?? 100;
 const LAPTOP_MULTIPLIER = 1.5;
 const WORK_JOBS = [
     "Software Developer",
@@ -74,7 +75,6 @@ export default {
             let earned = Math.floor(Math.random() * (MAX_WORK_AMOUNT - MIN_WORK_AMOUNT + 1)) + MIN_WORK_AMOUNT;
             const job = WORK_JOBS[Math.floor(Math.random() * WORK_JOBS.length)];
 
-            
             let multiplierMessage = "";
             if (hasLaptop > 0) {
                 earned = Math.floor(earned * LAPTOP_MULTIPLIER);
@@ -103,12 +103,12 @@ export default {
             )
                 .addFields(
                     {
-                        name: "💰 New Balance",
+                        name: "New Balance",
                         value: `$${userData.wallet.toLocaleString()}`,
                         inline: true,
                     },
                     {
-                        name: "⏰ Next Work",
+                        name: "Next Work",
                         value: `<t:${Math.floor((now + WORK_COOLDOWN) / 1000)}:R>`,
                         inline: true,
                     }
@@ -121,7 +121,3 @@ export default {
             await InteractionHelper.safeEditReply(interaction, { embeds: [embed] });
     }, { command: 'work' })
 };
-
-
-
-

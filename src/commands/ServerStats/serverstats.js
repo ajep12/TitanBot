@@ -1,6 +1,6 @@
 import { getColor } from '../../config/bot.js';
 import { SlashCommandBuilder, PermissionFlagsBits, MessageFlags, ChannelType } from 'discord.js';
-import { createEmbed, errorEmbed, successEmbed } from '../../utils/embeds.js';
+import { createEmbed, successEmbed } from '../../utils/embeds.js';
 import { logger } from '../../utils/logger.js';
 
 import { handleCreate } from './modules/serverstats_create.js';
@@ -9,6 +9,7 @@ import { handleUpdate } from './modules/serverstats_update.js';
 import { handleDelete } from './modules/serverstats_delete.js';
 
 import { InteractionHelper } from '../../utils/interactionHelper.js';
+import { replyUserError, ErrorTypes } from '../../utils/errorHandler.js';
 export default {
     data: new SlashCommandBuilder()
         .setName("serverstats")
@@ -89,44 +90,21 @@ export default {
     async execute(interaction, guildConfig, client) {
         const subcommand = interaction.options.getSubcommand();
 
-        try {
-            switch (subcommand) {
-                case "create":
-                    await handleCreate(interaction, client);
-                    break;
-                case "list":
-                    await handleList(interaction, client);
-                    break;
-                case "update":
-                    await handleUpdate(interaction, client);
-                    break;
-                case "delete":
-                    await handleDelete(interaction, client);
-                    break;
-                default:
-                    await InteractionHelper.safeReply(interaction, {
-                        embeds: [errorEmbed("Unknown subcommand.")],
-                        flags: MessageFlags.Ephemeral
-                    });
-            }
-        } catch (error) {
-            logger.error(`Error in serverstats ${subcommand}:`, error);
-            
-            const errorEmbedMsg = createEmbed({ 
-                title: "❌ Error", 
-                description: "An error occurred while processing your request.",
-                color: getColor('error')
-            });
-
-            if (!interaction.replied && !interaction.deferred) {
-                await InteractionHelper.safeReply(interaction, { embeds: [errorEmbedMsg], flags: MessageFlags.Ephemeral }).catch(logger.error);
-            } else {
-                await interaction.followUp({ embeds: [errorEmbedMsg], flags: MessageFlags.Ephemeral }).catch(logger.error);
-            }
+        switch (subcommand) {
+            case "create":
+                await handleCreate(interaction, client);
+                break;
+            case "list":
+                await handleList(interaction, client);
+                break;
+            case "update":
+                await handleUpdate(interaction, client);
+                break;
+            case "delete":
+                await handleDelete(interaction, client);
+                break;
+            default:
+                await replyUserError(interaction, { type: ErrorTypes.VALIDATION, message: 'Unknown subcommand.' });
         }
     }
 };
-
-
-
-

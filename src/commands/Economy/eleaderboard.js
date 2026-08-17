@@ -3,14 +3,14 @@ import { createEmbed } from '../../utils/embeds.js';
 import { withErrorHandling, createError, ErrorTypes } from '../../utils/errorHandler.js';
 import { logger } from '../../utils/logger.js';
 import { InteractionHelper } from '../../utils/interactionHelper.js';
+import { getEconomyPrefix } from '../../utils/database.js';
 
 export default {
     data: new SlashCommandBuilder()
         .setName("eleaderboard")
         .setDescription("View the server's top 10 richest users.")
         .setDMPermission(false),
-    
-    
+
     execute: withErrorHandling(async (interaction, config, client) => {
         const deferred = await InteractionHelper.safeDefer(interaction);
         if (!deferred) return;
@@ -19,7 +19,7 @@ export default {
 
             logger.debug(`[ECONOMY] Leaderboard requested`, { guildId });
 
-            const prefix = `economy:${guildId}:`;
+            const prefix = getEconomyPrefix(guildId);
 
             let allKeys = await client.db.list(prefix);
 
@@ -81,14 +81,9 @@ export default {
             const embed = createEmbed({
                 title: `Economy Leaderboard`,
                 description,
-                footer: `Your Rank: ${userRank > 0 ? `#${userRank}` : "No ranking data available"}`,
+                footer: `Your Rank: ${userRank > 0 ?`#${userRank}`: "No ranking data available"}`,
             });
 
             await InteractionHelper.safeEditReply(interaction, { embeds: [embed] });
     }, { command: 'eleaderboard' })
 };
-
-
-
-
-

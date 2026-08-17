@@ -1,8 +1,9 @@
 import { SlashCommandBuilder, PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, MessageFlags } from 'discord.js';
-import { createEmbed, errorEmbed, successEmbed } from '../../utils/embeds.js';
+import { createEmbed, successEmbed } from '../../utils/embeds.js';
 import { getModerationCases } from '../../utils/moderation.js';
 import { logger } from '../../utils/logger.js';
 import { InteractionHelper } from '../../utils/interactionHelper.js';
+import { replyUserError, ErrorTypes } from '../../utils/errorHandler.js';
 export default {
     data: new SlashCommandBuilder()
         .setName('cases')
@@ -30,6 +31,8 @@ export default {
                 .setMinValue(1)
                 .setMaxValue(50)
         ),
+
+    category: 'moderation',
 
     async execute(interaction, config, client) {
         const deferSuccess = await InteractionHelper.safeDefer(interaction);
@@ -72,7 +75,7 @@ export default {
                 const pageCases = cases.slice(startIndex, endIndex);
 
                 const embed = createEmbed({
-                    title: '📋 Moderation Cases',
+                    title: 'Moderation Cases',
                     description: `Showing moderation cases for **${interaction.guild.name}**\n\n**Page ${page} of ${totalPages}**`
                 });
 
@@ -88,7 +91,7 @@ export default {
                 });
 
                 embed.setFooter({
-                    text: `Total cases: ${cases.length} | Filter: ${filterType}${targetUser ? ` | User: ${targetUser.tag}` : ''}`
+                    text: `Total cases: ${cases.length} | Filter: ${filterType}${targetUser ?` | User: ${targetUser.tag}`: ''}`
                 });
 
                 return embed;
@@ -148,7 +151,7 @@ time: 120000
                     currentPage++;
                 }
 
-                await buttonInteraction.editReply({
+                await interaction.editReply({
                     embeds: [createCasesEmbed(currentPage)],
                     components: [createNavigationRow(currentPage)]
                 });
@@ -168,19 +171,7 @@ time: 120000
 
         } catch (error) {
             logger.error('Error in cases command:', error);
-            return InteractionHelper.safeEditReply(interaction, {
-                embeds: [
-                    errorEmbed(
-                        'System Error',
-                        'An error occurred while retrieving moderation cases. Please try again later.'
-                    )
-                ],
-                flags: MessageFlags.Ephemeral
-            });
+            return await replyUserError(interaction, { type: ErrorTypes.UNKNOWN, message: 'An error occurred while retrieving moderation cases. Please try again later.' });
         }
     }
 };
-
-
-
-

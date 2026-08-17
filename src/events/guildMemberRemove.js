@@ -1,11 +1,11 @@
 import { Events, EmbedBuilder, PermissionFlagsBits } from 'discord.js';
-import { getColor } from '../config/bot.js';
+import { getColor, botConfig } from '../config/bot.js';
 import { getWelcomeConfig, getUserApplications, deleteApplication } from '../utils/database.js';
 import { formatWelcomeMessage } from '../utils/welcome.js';
 import { logEvent, EVENT_TYPES } from '../services/loggingService.js';
 import { getServerCounters, updateCounter } from '../services/serverstatsService.js';
 import { getGuildBirthdays, deleteBirthday } from '../utils/database.js';
-import { deleteUserLevelData } from '../services/leveling.js';
+import { deleteUserLevelData } from '../services/leveling/leveling.js';
 import { logger } from '../utils/logger.js';
 
 export default {
@@ -31,7 +31,7 @@ export default {
 
                 const formatData = { user, guild, member };
                 const goodbyeMessage = formatWelcomeMessage(
-                    welcomeConfig.leaveMessage || welcomeConfig.leaveEmbed?.description || '{user.tag} has left the server.',
+                    welcomeConfig.leaveMessage || welcomeConfig.leaveEmbed?.description || botConfig.welcome?.defaultGoodbyeMessage || '{user} has left the server.',
                     formatData
                 );
 
@@ -77,40 +77,29 @@ export default {
                 }
             }
         }
-        
-        
+
         try {
             await logEvent({
                 client: member.client,
                 guildId: guild.id,
                 eventType: EVENT_TYPES.MEMBER_LEAVE,
                 data: {
-                    description: `${user.tag} left the server`,
+                    title: 'User left',
+                    lines: [
+                        `**User:** ${user.toString()} (${user.tag})`,
+                        `**ID:** \`${user.id}\``,
+                        `**Joined:** <t:${Math.floor((member.joinedTimestamp || Date.now()) / 1000)}:R>`,
+                        `**Members:** ${guild.memberCount}`,
+                    ],
+                    quoted: false,
+                    thumbnail: user.displayAvatarURL({ dynamic: true }),
                     userId: user.id,
-                    fields: [
-                        {
-                            name: '👤 Member',
-                            value: `${user.tag} (${user.id})`,
-                            inline: true
-                        },
-                        {
-                            name: '👥 Member Count',
-                            value: guild.memberCount.toString(),
-                            inline: true
-                        },
-                        {
-                            name: '📅 Joined',
-                            value: `<t:${Math.floor((member.joinedTimestamp || 0) / 1000)}:R>`,
-                            inline: true
-                        }
-                    ]
                 }
             });
         } catch (error) {
             logger.debug('Error logging member leave:', error);
         }
-        
-        
+
         try {
             const counters = await getServerCounters(member.client, guild.id);
             for (const counter of counters) {
@@ -121,8 +110,7 @@ export default {
         } catch (error) {
             logger.debug('Error updating counters on member leave:', error);
         }
-        
-        // Backup and remove birthday data when a member leaves
+
         try {
             const birthdays = await getGuildBirthdays(member.client, guild.id);
             if (birthdays[user.id]) {
@@ -136,8 +124,7 @@ export default {
         } catch (error) {
             logger.debug('Error handling birthday on member leave:', error);
         }
-        
-        // Remove all pending applications when a member leaves
+
         try {
             const userApplications = await getUserApplications(member.client, guild.id, user.id);
             if (userApplications && userApplications.length > 0) {
@@ -150,7 +137,6 @@ export default {
             logger.debug('Error handling applications on member leave:', error);
         }
 
-        // Remove leveling data when a member leaves
         try {
             await deleteUserLevelData(member.client, guild.id, user.id);
             logger.debug(`Removed leveling data for user ${user.id} in guild ${guild.id}`);
@@ -163,6 +149,3 @@ export default {
     }
   }
 };
-
-
-

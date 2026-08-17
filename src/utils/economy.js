@@ -1,9 +1,12 @@
-import { getColor } from './database.js';
+// economy.js
+
+import { getColor, getEconomyKey as getEconomyStorageKey } from './database.js';
 import { BotConfig } from '../config/bot.js';
 import { normalizeEconomyData } from './schemas.js';
 import { logger } from './logger.js';
 import { validateDiscordId, validateNumber } from './validation.js';
 import { DEFAULT_ECONOMY_DATA } from './constants.js';
+import { createError, ErrorTypes, wrapServiceBoundary } from './errorHandler.js';
 
 const ECONOMY_CONFIG = BotConfig.economy || {};
 const BASE_BANK_CAPACITY = ECONOMY_CONFIG.baseBankCapacity || 10000;
@@ -18,13 +21,6 @@ crime: 2 * 60 * 60 * 1000,
 rob: 4 * 60 * 60 * 1000,
 };
 
-
-
-
-
-
-
-
 export function getEconomyKey(guildId, userId) {
     const validGuildId = validateDiscordId(guildId, 'guildId');
     const validUserId = validateDiscordId(userId, 'userId');
@@ -33,51 +29,32 @@ export function getEconomyKey(guildId, userId) {
         throw new Error('Invalid guild ID or user ID');
     }
     
-    return `economy:${validGuildId}:${validUserId}`;
+    return getEconomyStorageKey(validGuildId, validUserId);
 }
-
-
-
-
-
 
 export function getMaxBankCapacity(userData) {
     if (!userData) return BASE_BANK_CAPACITY;
     
     const bankLevel = userData.bankLevel || 0;
     let capacity = BASE_BANK_CAPACITY + (bankLevel * BANK_CAPACITY_PER_LEVEL);
-    
-    
+
     const upgrades = userData.upgrades || {};
     const inventory = userData.inventory || {};
-    
-    
+
     if (upgrades['bank_upgrade_1']) {
         capacity = Math.floor(capacity * 1.5);
     }
-    
-    
+
     const bankNotes = inventory['bank_note'] || 0;
     capacity += (bankNotes * 10000);
     
     return capacity;
 }
 
-
-
-
-
-
 export function formatCurrency(amount) {
-    return `${amount.toLocaleString()} ${ECONOMY_CONFIG.currency || 'coins'}`;
+    const currencyName = ECONOMY_CONFIG.currency?.name || 'coins';
+    return `${amount.toLocaleString()} ${currencyName}`;
 }
-
-
-
-
-
-
-
 
 export async function getEconomyData(client, guildId, userId) {
     try {
@@ -87,21 +64,17 @@ export async function getEconomyData(client, guildId, userId) {
 
         const key = getEconomyKey(guildId, userId);
         const data = await client.db.get(key, {});
+        const defaults = {
+            ...DEFAULT_ECONOMY_DATA,
+            wallet: ECONOMY_CONFIG.startingBalance ?? DEFAULT_ECONOMY_DATA.wallet,
+        };
         
-        return normalizeEconomyData(data, DEFAULT_ECONOMY_DATA);
+        return normalizeEconomyData(data, defaults);
     } catch (error) {
         logger.error(`Error getting economy data for user ${userId}`, error);
         return normalizeEconomyData({}, DEFAULT_ECONOMY_DATA);
     }
 }
-
-
-
-
-
-
-
-
 
 export async function setEconomyData(client, guildId, userId, data) {
     try {
@@ -118,17 +91,6 @@ export async function setEconomyData(client, guildId, userId, data) {
         return false;
     }
 }
-
-
-
-
-
-
-
-
-
-
-
 
 export async function updateBalance(client, guildId, userId, options = {}) {
     const data = await getEconomyData(client, guildId, userId);
@@ -157,12 +119,6 @@ export async function updateBalance(client, guildId, userId, options = {}) {
     return data;
 }
 
-
-
-
-
-
-
 export function checkCooldown(userData, action) {
     const cooldownTime = COOLDOWNS[action] || 0;
     const lastUsed = userData[`last${action.charAt(0).toUpperCase() + action.slice(1)}`] || 0;
@@ -175,11 +131,6 @@ export function checkCooldown(userData, action) {
         formatted: formatCooldown(remaining)
     };
 }
-
-
-
-
-
 
 function formatCooldown(ms) {
     if (ms < 1000) return 'now';
@@ -194,10 +145,6 @@ function formatCooldown(ms) {
     if (minutes > 0) return `${minutes}m ${seconds % 60}s`;
     return `${seconds}s`;
 }
-
-
-
-
 
 export function getWorkReward() {
     const amount = Math.floor(Math.random() * (WORK_MAX - WORK_MIN + 1)) + WORK_MIN;
@@ -222,10 +169,6 @@ export function getWorkReward() {
         message: `You ${job} and earned ${formatCurrency(amount)}!`
     };
 }
-
-
-
-
 
 export function getCrimeOutcome() {
     const outcomes = [
@@ -264,11 +207,6 @@ export function getCrimeOutcome() {
     return outcomes[Math.floor(Math.random() * outcomes.length)];
 }
 
-
-
-
-
-
 export function getRobOutcome(targetBalance) {
     if (targetBalance <= 0) {
         return {
@@ -303,129 +241,113 @@ Math.floor(Math.random() * (targetBalance * 0.3)) + 1,
     }
 }
 
-
-
-
-
-
-
 export function formatShopItem(item, index) {
     return `**${index + 1}.** ${item.emoji} **${item.name}** - ${formatCurrency(item.price)}\n${item.description}\n`;
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-export async function addMoney(client, guildId, userId, amount, type = 'wallet') {
-    try {
-        
-        const validAmount = validateNumber(amount, 'amount');
-        if (validAmount === null || validAmount <= 0) {
-            return { success: false, error: 'Amount must be a positive number' };
-        }
-
-        if (type !== 'wallet' && type !== 'bank') {
-            logger.warn('[VALIDATION] Invalid money type:', { type });
-            return { success: false, error: 'Type must be "wallet" or "bank"' };
-        }
-
-        const userData = await getEconomyData(client, guildId, userId);
-        
-        if (type === 'bank') {
-            const maxBank = getMaxBankCapacity(userData);
-            if ((userData.bank || 0) + validAmount > maxBank) {
-                return { 
-                    success: false, 
-                    error: 'Bank capacity exceeded',
-                    current: userData.bank || 0,
-                    max: maxBank
-                };
-            }
-            userData.bank = (userData.bank || 0) + validAmount;
-        } else {
-            userData.wallet = (userData.wallet || 0) + validAmount;
-        }
-
-        await setEconomyData(client, guildId, userId, userData);
-        
-        return { 
-            success: true, 
-            newBalance: type === 'bank' ? userData.bank : userData.wallet,
-            ...(type === 'bank' ? { maxBank: getMaxBankCapacity(userData) } : {})
-        };
-    } catch (error) {
-        logger.error(`Error adding money to ${type} for user ${userId} in guild ${guildId}`, error);
-        return { success: false, error: 'An error occurred while processing your request' };
+export const addMoney = wrapServiceBoundary(async function addMoney(client, guildId, userId, amount, type = 'wallet') {
+    const validAmount = validateNumber(amount, 'amount');
+    if (validAmount === null || validAmount <= 0) {
+        throw createError(
+            'Invalid amount',
+            ErrorTypes.VALIDATION,
+            'Amount must be a positive number.',
+            { guildId, userId, amount, operation: 'addMoney' }
+        );
     }
-}
 
-
-
-
-
-
-
-
-
-
-export async function removeMoney(client, guildId, userId, amount, type = 'wallet') {
-    try {
-        
-        const validAmount = validateNumber(amount, 'amount');
-        if (validAmount === null || validAmount <= 0) {
-            return { success: false, error: 'Amount must be a positive number' };
-        }
-
-        if (type !== 'wallet' && type !== 'bank') {
-            logger.warn('[VALIDATION] Invalid money type:', { type });
-            return { success: false, error: 'Type must be "wallet" or "bank"' };
-        }
-
-        const userData = await getEconomyData(client, guildId, userId);
-        
-        if (type === 'bank') {
-            if ((userData.bank || 0) < validAmount) {
-                return { 
-                    success: false, 
-                    error: 'Insufficient funds in bank',
-                    current: userData.bank || 0,
-                    required: validAmount
-                };
-            }
-            userData.bank = (userData.bank || 0) - validAmount;
-        } else {
-            if ((userData.wallet || 0) < validAmount) {
-                return { 
-                    success: false, 
-                    error: 'Insufficient funds in wallet',
-                    current: userData.wallet || 0,
-                    required: validAmount
-                };
-            }
-            userData.wallet = (userData.wallet || 0) - validAmount;
-        }
-
-        await setEconomyData(client, guildId, userId, userData);
-        
-        return { 
-            success: true, 
-            newBalance: type === 'bank' ? userData.bank : userData.wallet
-        };
-    } catch (error) {
-        logger.error(`Error removing money from ${type} for user ${userId} in guild ${guildId}`, error);
-        return { success: false, error: 'An error occurred while processing your request' };
+    if (type !== 'wallet' && type !== 'bank') {
+        throw createError(
+            'Invalid money type',
+            ErrorTypes.VALIDATION,
+            'Type must be "wallet" or "bank".',
+            { guildId, userId, type, operation: 'addMoney' }
+        );
     }
-}
+
+    const userData = await getEconomyData(client, guildId, userId);
+
+    if (type === 'bank') {
+        const maxBank = getMaxBankCapacity(userData);
+        if ((userData.bank || 0) + validAmount > maxBank) {
+            throw createError(
+                'Bank capacity exceeded',
+                ErrorTypes.VALIDATION,
+                `Bank capacity exceeded. Current: ${userData.bank || 0}, Max: ${maxBank}.`,
+                { guildId, userId, current: userData.bank || 0, max: maxBank, operation: 'addMoney' }
+            );
+        }
+        userData.bank = (userData.bank || 0) + validAmount;
+    } else {
+        userData.wallet = (userData.wallet || 0) + validAmount;
+    }
+
+    await setEconomyData(client, guildId, userId, userData);
+
+    return {
+        newBalance: type === 'bank' ? userData.bank : userData.wallet,
+        ...(type === 'bank' ? { maxBank: getMaxBankCapacity(userData) } : {}),
+    };
+}, {
+    service: 'economy',
+    operation: 'addMoney',
+    userMessage: 'Failed to add money. Please try again.',
+});
+
+export const removeMoney = wrapServiceBoundary(async function removeMoney(client, guildId, userId, amount, type = 'wallet') {
+    const validAmount = validateNumber(amount, 'amount');
+    if (validAmount === null || validAmount <= 0) {
+        throw createError(
+            'Invalid amount',
+            ErrorTypes.VALIDATION,
+            'Amount must be a positive number.',
+            { guildId, userId, amount, operation: 'removeMoney' }
+        );
+    }
+
+    if (type !== 'wallet' && type !== 'bank') {
+        throw createError(
+            'Invalid money type',
+            ErrorTypes.VALIDATION,
+            'Type must be "wallet" or "bank".',
+            { guildId, userId, type, operation: 'removeMoney' }
+        );
+    }
+
+    const userData = await getEconomyData(client, guildId, userId);
+
+    if (type === 'bank') {
+        if ((userData.bank || 0) < validAmount) {
+            throw createError(
+                'Insufficient bank funds',
+                ErrorTypes.VALIDATION,
+                `Insufficient funds in bank. You have ${userData.bank || 0}, need ${validAmount}.`,
+                { guildId, userId, current: userData.bank || 0, required: validAmount, operation: 'removeMoney' }
+            );
+        }
+        userData.bank = (userData.bank || 0) - validAmount;
+    } else {
+        if ((userData.wallet || 0) < validAmount) {
+            throw createError(
+                'Insufficient wallet funds',
+                ErrorTypes.VALIDATION,
+                `Insufficient funds in wallet. You have ${userData.wallet || 0}, need ${validAmount}.`,
+                { guildId, userId, current: userData.wallet || 0, required: validAmount, operation: 'removeMoney' }
+            );
+        }
+        userData.wallet = (userData.wallet || 0) - validAmount;
+    }
+
+    await setEconomyData(client, guildId, userId, userData);
+
+    return {
+        newBalance: type === 'bank' ? userData.bank : userData.wallet,
+    };
+}, {
+    service: 'economy',
+    operation: 'removeMoney',
+    userMessage: 'Failed to remove money. Please try again.',
+});
 
 export function getShopInventory() {
     return [
@@ -475,6 +397,3 @@ export function getShopInventory() {
         }
     ];
 }
-
-
-

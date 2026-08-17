@@ -2,6 +2,7 @@ import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, EmbedBuild
 import { shopItems } from '../../../config/shop/items.js';
 import { getColor } from '../../../config/bot.js';
 import { logger } from '../../../utils/logger.js';
+import { handleInteractionError } from '../../../utils/errorHandler.js';
 
 export default {
     async execute(interaction, config, client) {
@@ -15,13 +16,13 @@ export default {
                 const startIndex = (page - 1) * ITEMS_PER_PAGE;
                 const pageItems = shopItems.slice(startIndex, startIndex + ITEMS_PER_PAGE);
                 const embed = new EmbedBuilder()
-                    .setTitle('🛒 Store')
+                    .setTitle('Store')
                     .setColor(getColor('primary'))
                     .setDescription('Use `/buy item_id:<id> quantity:<amount>` to purchase an item.');
                 pageItems.forEach(item => {
                     embed.addFields({
                         name: `${item.name} (${item.id})`,
-                        value: `🏷️ **Type:** ${item.type}\n💚 **Price:** $${item.price.toLocaleString()}\n${item.description}`,
+                        value: `**Type:** ${item.type}\n **Price:** $${item.price.toLocaleString()}\n${item.description}`,
                         inline: false,
                     });
                 });
@@ -60,7 +61,7 @@ export default {
 
             collector.on('collect', async (buttonInteraction) => {
                 if (buttonInteraction.user.id !== interaction.user.id) {
-                    await buttonInteraction.reply({ content: '❌ You cannot use these buttons. Run `/shop browse` to get your own shop view.', flags: 64 });
+                    await buttonInteraction.reply({ content: '❌ You cannot use these buttons. Run `/shop` to get your own shop view.', flags: 64 });
                     return;
                 }
                 const { customId } = buttonInteraction;
@@ -80,11 +81,14 @@ export default {
                     const disabledComponents = createShopComponents(currentPage);
                     disabledComponents.forEach(row => row.components.forEach(btn => btn.setDisabled(true)));
                     await message.edit({ components: disabledComponents });
-                } catch (_) {}
+                } catch (error) {
+                    logger.debug('shop_browse: could not disable components on collector end', {
+                        error: error.message,
+                    });
+                }
             });
         } catch (error) {
-            logger.error('shop_browse error:', error);
-            await interaction.reply({ content: '❌ An error occurred while loading the shop.', flags: MessageFlags.Ephemeral });
+            await handleInteractionError(interaction, error, { command: 'shop_browse' });
         }
     },
 };

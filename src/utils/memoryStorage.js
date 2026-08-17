@@ -1,9 +1,7 @@
+// memoryStorage.js
+
 import { logger } from './logger.js';
 
-/**
- * In-memory storage fallback for when database is unavailable
- * Used when PostgreSQL connection fails
- */
 class MemoryStorage {
     constructor() {
         this.data = new Map();
@@ -43,7 +41,7 @@ class MemoryStorage {
 
     async list(prefix) {
         const keys = [];
-        for (const [key] of this.data.keys()) {
+        for (const key of this.data.keys()) {
             if (key.startsWith(prefix)) {
                 if (this.expirationTimes.has(key)) {
                     const expirationTime = this.expirationTimes.get(key);
@@ -96,5 +94,3 @@ class MemoryStorage {
 }
 
 export { MemoryStorage };
-
-
